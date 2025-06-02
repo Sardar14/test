@@ -1,23 +1,5 @@
-# Read Me
-Sometimes you want numbered lists:
+,
 
-1. One
-2. Two
-3. Three
-
-Sometimes you want bullet points:
-
-* Start a line with a star
-* Profit!
-
-Alternatively,
-
-- Dashes work just as well
-- And if you have sub points, put two spaces before the dash or star:
-  - Like this
-  - And this
-
-```
 ################### model.py #########################
 """
 Copyright (c) 2019-present NAVER Corp.
@@ -44,7 +26,7 @@ from modules.prediction import Attention
 
 
 class LanguageClassifier(nn.Module):
-    """Language classification module"""
+    """Standalone language classification module"""
     def __init__(self, input_size, num_classes=4):
         super(LanguageClassifier, self).__init__()
         self.classifier = nn.Sequential(
@@ -66,8 +48,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.opt = opt
         self.stages = {'Trans': opt.Transformation, 'Feat': opt.FeatureExtraction,
-                       'Seq': opt.SequenceModeling, 'Pred': opt.Prediction,
-                       'LangCls': opt.LanguageClassification}
+                       'Seq': opt.SequenceModeling, 'Pred': opt.Prediction}
 
         """ Transformation """
         if opt.Transformation == 'TPS':
@@ -106,13 +87,6 @@ class Model(nn.Module):
         else:
             raise Exception('Prediction is neither CTC or Attn')
             
-        """ Language Classification """
-        if opt.LanguageClassification:
-            self.LanguageClassifier = LanguageClassifier(
-                input_size=self.SequenceModeling_output,
-                num_classes=4  # Kurdish=0, Arabic=1, English=2, Number=3
-            )
-
     def forward(self, input, text=None, is_train=True, return_attention=False):
         """ Transformation stage """
         if not self.stages['Trans'] == "None":
@@ -129,11 +103,6 @@ class Model(nn.Module):
         else:
             contextual_feature = visual_feature  # for convenience. this is NOT contextually modeled by BiLSTM
             
-        """ Language Classification """
-        lang_logits = None
-        if self.stages['LangCls']:
-            lang_logits = self.LanguageClassifier(contextual_feature)
-
         """ Prediction stage """
         prediction = None
         attention_weights = None
@@ -147,339 +116,230 @@ class Model(nn.Module):
 
         outputs = {
             'prediction': prediction,
-            'lang_logits': lang_logits,
+            'contextual_feature': contextual_feature,
             'attention_weights': attention_weights
         }
         
         return outputs
 
-################### dataset.py #########################
+################### train_lang_classifier.py #########################
+"""
+Standalone language classifier training
+"""
 import os
 import sys
-import re
-import six
-import math
-import lmdb
+import time
+import random
+import argparse
+
 import torch
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+from torch.utils.data import DataLoader
 
-from natsort import natsorted
-from PIL import Image
-import numpy as np
-from torch.utils.data import Dataset, ConcatDataset, Subset
-from itertools import accumulate
-import torchvision.transforms as transforms
+from dataset import LmdbDataset
+from model import LanguageClassifier
+from utils import CTCLabelConverter, AttnLabelConverter, Averager
 
-# ... [previous code remains unchanged] ...
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-class LmdbDataset(Dataset):
-    def __init__(self, root, opt):
-        self.root = root
-        self.opt = opt
-        self.env = lmdb.open(root, max_readers=32, readonly=True, lock=False, readahead=False, meminit=False)
-        if not self.env:
-            print('cannot create lmdb from %s' % (root))
-            sys.exit(0)
 
-        with self.env.begin(write=False) as txn:
-            nSamples = int(txn.get('num-samples'.encode()))
-            self.nSamples = nSamples
-
-            if self.opt.data_filtering_off:
-                self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
-            else:
-                self.filtered_index_list = []
-                for index in range(self.nSamples):
-                    index += 1
-                    label_key = 'label-%09d'.encode() % index
-                    label_str = txn.get(label_key).decode('utf-8')
-                    
-                    # Parse language class from label format: text\tlang_class
-                    if '\t' in label_str:
-                        label, lang_class = label_str.split('\t')
-                    else:
-                        label = label_str
-                        lang_class = '0'  # Default to Kurdish
-
-                    if len(label) > self.opt.batch_max_length:
-                        continue
-
-                    out_of_char = f'[^{self.opt.character}]'
-                    if re.search(out_of_char, label.lower()):
-                        continue
-
-                    self.filtered_index_list.append(index)
-
-                self.nSamples = len(self.filtered_index_list)
-
-    def __len__(self):
-        return self.nSamples
-
-    def __getitem__(self, index):
-        assert index <= len(self), 'index range error'
-        index = self.filtered_index_list[index]
-
-        with self.env.begin(write=False) as txn:
-            label_key = 'label-%09d'.encode() % index
-            label_str = txn.get(label_key).decode('utf-8')
-            
-            # Parse language class from label format: text\tlang_class
-            if '\t' in label_str:
-                label, lang_class = label_str.split('\t')
-                lang_class = int(lang_class)
-            else:
-                label = label_str
-                lang_class = 0  # Default to Kurdish
-
-            img_key = 'image-%09d'.encode() % index
-            imgbuf = txn.get(img_key)
-
-            buf = six.BytesIO()
-            buf.write(imgbuf)
-            buf.seek(0)
-            try:
-                if self.opt.rgb:
-                    img = Image.open(buf).convert('RGB')
-                else:
-                    img = Image.open(buf).convert('L')
-
-            except IOError:
-                print(f'Corrupted image for {index}')
-                if self.opt.rgb:
-                    img = Image.new('RGB', (self.opt.imgW, self.opt.imgH))
-                else:
-                    img = Image.new('L', (self.opt.imgW, self.opt.imgH))
-                label = '[dummy_label]'
-                lang_class = 0
-
-            if not self.opt.sensitive:
-                label = label.lower()
-
-            out_of_char = f'[^{self.opt.character}]'
-            label = re.sub(out_of_char, '', label)
-
-        return (img, label, lang_class)
-
-# ... [rest of dataset.py remains unchanged] ...
-
-################### train.py #########################
-# ... [previous imports remain unchanged] ...
-
-def train(opt):
-    """ dataset preparation """
-    # ... [previous setup code remains unchanged] ...
-
-    """ model configuration """
-    # ... [previous converter setup remains unchanged] ...
-    opt.num_class = len(converter.character)
-
-    if opt.rgb:
-        opt.input_channel = 3
-    model = Model(opt)
-    # ... [previous model setup remains unchanged] ...
-
-    """ setup loss """
-    # OCR loss
-    if 'CTC' in opt.Prediction:
-        # ... [previous CTC setup] ...
-    else:
-        ocr_criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
+def train_lang_classifier(opt):
+    """ Dataset preparation for language classification """
+    # Create dataset
+    train_dataset = LmdbDataset(root=opt.train_data, opt=opt)
+    valid_dataset = LmdbDataset(root=opt.valid_data, opt=opt)
     
-    # Language classification loss
-    lang_criterion = torch.nn.CrossEntropyLoss().to(device)
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=opt.batch_size,
+        shuffle=True,
+        num_workers=int(opt.workers),
+        pin_memory=True)
     
-    # ... [rest of setup remains unchanged] ...
-
-    while(True):
-        # train part
-        image_tensors, labels, lang_labels = train_dataset.get_batch()
-        image = image_tensors.to(device)
-        text, length = converter.encode(labels, batch_max_length=opt.batch_max_length)
-        lang_labels = torch.LongTensor(lang_labels).to(device)
-        batch_size = image.size(0)
-
-        # Forward pass
-        model_outputs = model(image, text)
-        preds = model_outputs['prediction']
-        lang_logits = model_outputs['lang_logits']
-
-        # Calculate losses
-        if 'CTC' in opt.Prediction:
-            # ... [CTC loss calculation] ...
-        else:
-            target = text[:, 1:]  # without [GO] Symbol
-            ocr_loss = ocr_criterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
-            
-        # Language classification loss
-        lang_loss = lang_criterion(lang_logits, lang_labels)
-        
-        # Combined loss
-        total_loss = ocr_loss + 0.5 * lang_loss  # Weighted sum
-
-        model.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
-        optimizer.step()
-
-        loss_avg.add(total_loss)
-
-        # validation part
-        if (iteration + 1) % opt.valInterval == 0 or iteration == 0:
-            elapsed_time = time.time() - start_time
-            with open(f'./saved_models/{opt.exp_name}/log_train.txt', 'a', encoding="utf-8") as log:
-                model.eval()
-                
-                with torch.no_grad():
-                    # Update validation function to return language accuracy
-                    valid_loss, current_accuracy, current_norm_ED, lang_accuracy, preds, confidence_score, labels, infer_time, length_of_data = validation(
-                        model, ocr_criterion, lang_criterion, valid_loader, converter, opt)
-                    
-                model.train()
-                
-                # ... [logging remains similar, but add language accuracy] ...
-                lang_accuracy_log = f'{"Language_accuracy":17s}: {lang_accuracy:0.3f}'
-                
-                # ... [rest of validation logging] ...
-
-        # ... [model saving remains unchanged] ...
-
-# ... [rest of train.py remains unchanged] ...
-
-################### test.py #########################
-# Note: This is a new file for validation function with language classification
-import torch
-import numpy as np
-from tqdm import tqdm
-from utils import CTCLabelConverter, AttnLabelConverter
-
-def validation(model, ocr_criterion, lang_criterion, loader, converter, opt):
-    """ Evaluation function with language classification """
-    n_correct = 0
-    norm_ED = 0
-    length_of_data = 0
-    infer_time = 0
-    valid_ocr_loss = 0
-    valid_lang_loss = 0
-    lang_correct = 0
-    total_samples = 0
+    valid_loader = DataLoader(
+        valid_dataset, batch_size=opt.batch_size,
+        shuffle=False,
+        num_workers=int(opt.workers),
+        pin_memory=True)
     
-    # For language classification
-    lang_conf_matrix = np.zeros((4, 4), dtype=int)  # Kurdish, Arabic, English, Number
+    # Initialize the OCR model to extract features
+    ocr_model = Model(opt)
+    ocr_model = torch.nn.DataParallel(ocr_model).to(device)
+    print(f'Loading OCR model from {opt.ocr_model_path}')
+    ocr_model.load_state_dict(torch.load(opt.ocr_model_path, map_location=device))
+    ocr_model.eval()  # Freeze OCR model
     
-    for image_tensors, labels, lang_labels in tqdm(loader):
-        batch_size = image_tensors.size(0)
-        image = image_tensors.to(device)
-        text, length = converter.encode(labels, batch_max_length=opt.batch_max_length)
-        lang_labels = torch.LongTensor(lang_labels).to(device)
-        
-        # Forward pass
-        model_outputs = model(image, text, is_train=False)
-        preds = model_outputs['prediction']
-        lang_logits = model_outputs['lang_logits']
-        
-        # OCR loss calculation
-        if 'CTC' in opt.Prediction:
-            # ... [CTC loss calculation] ...
-        else:
-            target = text[:, 1:]
-            ocr_loss = ocr_criterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
-        
-        # Language classification loss
-        lang_loss = lang_criterion(lang_logits, lang_labels)
-        
-        valid_ocr_loss += ocr_loss.item()
-        valid_lang_loss += lang_loss.item()
-        
-        # Calculate OCR accuracy
-        if 'CTC' in opt.Prediction:
-            # ... [CTC decoding] ...
-        else:
-            _, preds_index = preds.max(2)
-            preds_str = converter.decode(preds_index, length)
-        
-        # Calculate language accuracy
-        _, lang_preds = lang_logits.max(1)
-        lang_correct += (lang_preds == lang_labels).sum().item()
-        
-        # Update confusion matrix
-        for t, p in zip(lang_labels.cpu().numpy(), lang_preds.cpu().numpy()):
-            lang_conf_matrix[t][p] += 1
-        
-        # ... [rest of OCR accuracy calculation] ...
-        
-        total_samples += batch_size
-    
-    # Calculate metrics
-    valid_ocr_loss /= len(loader)
-    valid_lang_loss /= len(loader)
-    valid_total_loss = valid_ocr_loss + 0.5 * valid_lang_loss
-    
-    accuracy = n_correct / float(total_samples)
-    norm_ED = norm_ED / float(total_samples)  # if you use ED
-    lang_accuracy = lang_correct / float(total_samples)
-    
-    # Print confusion matrix
-    print("Language Confusion Matrix:")
-    print("     Kurdish  Arabic  English  Number")
-    for i, row in enumerate(lang_conf_matrix):
-        print(f"{['Kurdish','Arabic','English','Number'][i]}: {row}")
-    
-    return (
-        valid_total_loss, accuracy, norm_ED, lang_accuracy, 
-        preds_str, confidence_score, labels, infer_time, length_of_data
+    # Initialize language classifier
+    lang_classifier = LanguageClassifier(
+        input_size=opt.hidden_size,
+        num_classes=4  # Kurdish=0, Arabic=1, English=2, Number=3
     )
+    lang_classifier = lang_classifier.to(device)
+    
+    # Setup loss and optimizer
+    criterion = torch.nn.CrossEntropyLoss().to(device)
+    optimizer = optim.Adam(lang_classifier.parameters(), lr=opt.lr)
+    
+    # Training loop
+    best_accuracy = 0
+    for epoch in range(opt.num_epoch):
+        # Train
+        lang_classifier.train()
+        train_loss_avg = Averager()
+        
+        for i, (images, _, lang_labels) in enumerate(train_loader):
+            images = images.to(device)
+            lang_labels = torch.LongTensor(lang_labels).to(device)
+            
+            # Extract features from OCR model
+            with torch.no_grad():
+                features = ocr_model(images)['contextual_feature']
+            
+            # Forward pass through language classifier
+            lang_logits = lang_classifier(features)
+            
+            # Calculate loss
+            loss = criterion(lang_logits, lang_labels)
+            
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            train_loss_avg.add(loss)
+            
+            if i % 50 == 0:
+                print(f'Epoch [{epoch+1}/{opt.num_epoch}], '
+                      f'Step [{i}/{len(train_loader)}], '
+                      f'Loss: {train_loss_avg.val():.4f}')
+        
+        # Validation
+        lang_classifier.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for images, _, lang_labels in valid_loader:
+                images = images.to(device)
+                lang_labels = lang_labels.to(device)
+                
+                # Extract features from OCR model
+                features = ocr_model(images)['contextual_feature']
+                
+                # Forward pass through language classifier
+                lang_logits = lang_classifier(features)
+                
+                # Calculate accuracy
+                _, predicted = torch.max(lang_logits.data, 1)
+                total += lang_labels.size(0)
+                correct += (predicted == lang_labels).sum().item()
+        
+        accuracy = 100 * correct / total
+        print(f'Epoch [{epoch+1}/{opt.num_epoch}], '
+              f'Validation Accuracy: {accuracy:.2f}%')
+        
+        # Save best model
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            torch.save(lang_classifier.state_dict(), 
+                      f'./saved_models/{opt.exp_name}/best_lang_classifier.pth')
+    
+    print(f'Training complete. Best accuracy: {best_accuracy:.2f}%')
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--exp_name', required=True, help='Experiment name')
+    parser.add_argument('--train_data', required=True, help='Path to training LMDB dataset')
+    parser.add_argument('--valid_data', required=True, help='Path to validation LMDB dataset')
+    parser.add_argument('--ocr_model_path', required=True, help='Path to pre-trained OCR model')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
+    parser.add_argument('--num_epoch', type=int, default=20, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    
+    # OCR model parameters (must match the trained OCR model)
+    parser.add_argument('--Transformation', type=str, required=True, help='Transformation stage. None|TPS')
+    parser.add_argument('--FeatureExtraction', type=str, required=True, help='FeatureExtraction stage. VGG|RCNN|ResNet')
+    parser.add_argument('--SequenceModeling', type=str, required=True, help='SequenceModeling stage. None|BiLSTM')
+    parser.add_argument('--Prediction', type=str, required=True, help='Prediction stage. CTC|Attn')
+    parser.add_argument('--num_fiducial', type=int, default=20, help='Number of fiducial points of TPS-STN')
+    parser.add_argument('--input_channel', type=int, default=1, help='Number of input channels')
+    parser.add_argument('--output_channel', type=int, default=512, help='Number of output channels')
+    parser.add_argument('--hidden_size', type=int, default=256, help='Size of LSTM hidden state')
+    parser.add_argument('--character', type=str, default='!%()-./0123456789:،؟ءآأؤإئابتثجحخدرزسشصضطعغفقكلمنهوي٠١٢٣٤٥٦٧٨٩پچڕژڤگڵۆیێە', help='Character set')
+    
+    opt = parser.parse_args()
+    
+    os.makedirs(f'./saved_models/{opt.exp_name}', exist_ok=True)
+    train_lang_classifier(opt)
 
 ################### demo.py #########################
-# ... [previous imports remain unchanged] ...
+# ... [previous imports] ...
 
 def demo(opt):
     """ model configuration """
     # ... [previous converter setup] ...
     
-    # Load model
-    model = Model(opt)
-    # ... [previous model loading] ...
+    # Load OCR model
+    ocr_model = Model(opt)
+    ocr_model = torch.nn.DataParallel(ocr_model).to(device)
+    print(f'Loading OCR model from {opt.saved_model}')
+    ocr_model.load_state_dict(torch.load(opt.saved_model, map_location=device))
+    ocr_model.eval()
     
-    # Class names
-    lang_classes = ['Kurdish', 'Arabic', 'English', 'Number']
+    # Load language classifier if available
+    lang_classifier = None
+    if opt.lang_classifier_path:
+        lang_classifier = LanguageClassifier(
+            input_size=opt.hidden_size,
+            num_classes=4
+        )
+        lang_classifier.load_state_dict(torch.load(opt.lang_classifier_path, map_location=device))
+        lang_classifier = lang_classifier.to(device)
+        lang_classifier.eval()
+        lang_classes = ['Kurdish', 'Arabic', 'English', 'Number']
     
-    # ... [previous data loading] ...
+    # ... [rest of demo setup] ...
     
     with torch.no_grad():
         for image_tensors, image_path_list in demo_loader:
             # ... [previous setup] ...
             
-            # Forward pass
-            model_outputs = model(image, text_for_pred, is_train=False)
-            preds = model_outputs['prediction']
-            lang_logits = model_outputs['lang_logits']
-            attention_weights = model_outputs['attention_weights']
+            # Forward pass through OCR model
+            ocr_outputs = ocr_model(image, text_for_pred, is_train=False)
+            preds = ocr_outputs['prediction']
+            attention_weights = ocr_outputs['attention_weights']
             
-            # Language prediction
-            lang_probs = F.softmax(lang_logits, dim=1)
-            _, lang_preds = lang_logits.max(1)
+            # Forward pass through language classifier if available
+            lang_pred = None
+            if lang_classifier:
+                contextual_feature = ocr_outputs['contextual_feature']
+                lang_logits = lang_classifier(contextual_feature)
+                lang_probs = F.softmax(lang_logits, dim=1)
+                _, lang_preds = lang_logits.max(1)
             
             # ... [previous OCR processing] ...
             
-            for i, (img_name, pred, pred_max_prob, lang_pred) in enumerate(zip(image_path_list, preds_str, preds_max_prob, lang_preds)):
+            for i, (img_name, pred, pred_max_prob) in enumerate(zip(image_path_list, preds_str, preds_max_prob)):
                 # ... [previous OCR processing] ...
                 
-                # Get language prediction
-                lang_class = lang_pred.item()
-                lang_name = lang_classes[lang_class]
-                lang_prob = lang_probs[i][lang_class].item()
+                # Add language prediction if available
+                lang_info = ""
+                if lang_classifier:
+                    lang_class = lang_preds[i].item()
+                    lang_name = lang_classes[lang_class]
+                    lang_prob = lang_probs[i][lang_class].item()
+                    lang_info = f" | Language: {lang_name} ({lang_prob:.2f})"
                 
-                # ... [rest of processing] ...
+                print(f'{img_name:25s}\t{pred:25s}\t{confidence_score:0.4f}{lang_info}')
                 
-                # Add language to output
-                print(f'{img_name:25s}\t{pred:25s}\t{lang_name} ({lang_prob:.2f})\t{confidence_score:0.4f}')
-                
-                # Visualize attention if using attention-based prediction
-                if 'Attn' in opt.Prediction and attention_weights is not None:
-                    # ... [attention visualization remains unchanged] ...
+                # ... [attention visualization] ...
 
-# ... [rest of demo.py remains unchanged] ...
-```
-But I have to admit, tasks lists are my favorite:
+# ... [rest of demo.py] ...
 
-- [x] This is a complete item
-- [ ] This is an incomplete item
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    # ... [previous arguments] ...
+    parser.add_argument('--lang_classifier_path', default='', help='Path to trained language classifier')
+    # ... [rest of arguments] ...
